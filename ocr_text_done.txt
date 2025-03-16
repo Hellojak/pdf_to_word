@@ -1,0 +1,169 @@
+import os
+import sys
+import logging
+import time
+import re
+from pathlib import Path
+from typing import Optional
+from datetime import datetime
+from PyPDF2 import PdfReader, errors as pdf_errors
+from pdf2image import convert_from_path, exceptions as pdfimage_errors
+import pytesseract
+from docx import Document
+from docx.shared import Pt
+from PIL import Image
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler('conversion.log'), logging.StreamHandler()]
+)
+
+class PDFConversionError(Exception):
+    """Base class for conversion exceptions"""
+    pass
+
+class PDFConverter:
+    def __init__(self, poppler_path: Optional[str] = None, tesseract_path: Optional[str] = None):
+        self.poppler_path = poppler_path
+        self.tesseract_path = tesseract_path
+        if self.tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+
+    def _handle_error(self, error: Exception, message: str):
+        logging.error(f"{message}: {str(error)}")
+        raise PDFConversionError(message) from error
+
+    def convert_pdf_to_word(
+        self,
+        input_pdf: str,
+        output_docx: str,
+        ocr_fallback: bool = True,
+        dpi: int = 300
+    ) -> None:
+        """Convert PDF to plain editable text document"""
+        try:
+            # Try direct text extraction first
+            self._convert_with_pypdf2(input_pdf, output_docx)
+        except Exception as text_error:
+            if ocr_fallback:
+                logging.warning("Text extraction failed, attempting OCR...")
+                self._convert_with_ocr(input_pdf, output_docx, dpi)
+            else:
+                self._handle_error(text_error, "Conversion failed")
+
+    def _generate_output_path(self, input_path: Path) -> Path:
+        """Generate output path with timestamp"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return input_path.with_name(f"{input_path.stem}_converted_{timestamp}.docx")
+
+
+    def _convert_with_pypdf2(self, input_pdf: str, output_docx: str) -> None:
+        """Extract raw text without formatting"""
+        doc = Document()
+        try:
+            with open(input_pdf, 'rb') as f:
+                reader = PdfReader(f)
+                
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        # Clean text and add as single paragraph
+                        clean_text = self._clean_text(text)
+                        doc.add_paragraph(clean_text)
+                
+                if len(doc.paragraphs) == 0:
+                    raise PDFConversionError("No text extracted from PDF")
+                
+                doc.save(output_docx)
+        except Exception as e:
+            self._handle_error(e, "Text extraction failed")
+
+    def _convert_with_ocr(self, input_pdf: str, output_docx: str, dpi: int = 300) -> None:
+        """OCR with raw text output"""
+        doc = Document()
+        temp_images = []
+        try:
+            images = convert_from_path(
+                input_pdf,
+                dpi=dpi,
+                poppler_path=self.poppler_path,
+                fmt='png',
+                strict=True
+            )
+            
+            for i, image in enumerate(images):
+            # Create temporary image path
+                img_path = f"temp_page_{i+1}.png"
+                image.save(img_path)
+                temp_images.append(img_path)
+            
+            # Process from saved image file
+                text = pytesseract.image_to_string(Image.open(img_path))
+                clean_text = self._clean_text(text)
+                doc.add_paragraph(clean_text)
+            
+            doc.save(output_docx)
+        except Exception as e:
+            logging.error(f"OCR Error: {str(e)}")
+            raise
+        finally:
+            self._clean_temp_files(temp_images)
+
+    def _clean_text(self, text: str) -> str:
+        """Clean text for better editing"""
+        # Remove hyphenation and join words
+        text = text.replace('-\n', '')
+        # Normalize whitespace
+        text = ' '.join(text.split())
+        # Remove special characters
+        text = re.sub(r'[^\w\s\-.,;:?!@#$%&*()]', '', text)
+        return text
+
+    def _clean_temp_files(self, temp_files: list):
+        """Clean temporary files"""
+        for file_path in temp_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                logging.warning(f"Cleanup failed: {str(e)}")
+
+def clean_dragged_path(raw_path: str) -> Path:
+    """Universal path cleaner"""
+    cleaned = re.sub(r"^[&'\"]+|[&'\"]+$", "", raw_path).strip()
+    cleaned = cleaned.replace('^', ' ').replace('`', '')
+    
+    if not Path(cleaned).is_absolute():
+        cleaned = str(Path.cwd() / cleaned)
+    
+    path_obj = Path(cleaned)
+    
+    if not path_obj.exists():
+        raise FileNotFoundError(f"File not found: {cleaned}")
+    if path_obj.suffix.lower() != '.pdf':
+        raise ValueError(f"Not a PDF file: {path_obj.name}")
+    
+    return path_obj
+
+if __name__ == "__main__":
+    try:
+        converter = PDFConverter(
+            poppler_path=r"C:\poppler-24.08.0\Library\bin",
+            tesseract_path=r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        )
+
+        print("\n" + "="*50)
+        print("PDF to Editable Word Converter".center(50))
+        print("="*50 + "\n")
+        
+        pdf_path = clean_dragged_path(input("Drag PDF or enter path: ").strip())
+        output_path = converter._generate_output_path(pdf_path)
+        
+        converter.convert_pdf_to_word(str(pdf_path), str(output_path))
+        print(f"\n✅ Success! File saved to: {output_path}")
+
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        sys.exit(1)
